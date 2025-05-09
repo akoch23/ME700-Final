@@ -4,10 +4,12 @@ import numpy as np
 import dolfinx
 from dolfinx import io, mesh, fem, default_scalar_type, plot
 from dolfinx.fem.petsc import LinearProblem
+from dolfinx.mesh import compute_incident_entities
+from dolfinx.geometry import BoundingBoxTree, compute_collisions_points
 import ufl
 from mpi4py import MPI
 import pyvista as pv
-import h5py
+# import h5py
 
 
 # Start X Virtual Framebuffer (necessary for headless rendering)
@@ -69,6 +71,7 @@ top_center_facets = mesh.locate_entities_boundary(domain, fdim, top_center)
 top_center_tag = 4
 left_facets = mesh.locate_entities_boundary(domain, fdim, left_marker)
 right_facets = mesh.locate_entities_boundary(domain, fdim, right_marker)
+
 marked_facets = np.hstack([left_facets, right_facets, top_center_facets])
 marked_values = np.hstack([
     np.full_like(left_facets, 1),
@@ -77,6 +80,11 @@ marked_values = np.hstack([
 ])
 sort_idx = np.argsort(marked_facets)
 facet_tag = mesh.meshtags(domain, fdim, marked_facets[sort_idx], marked_values[sort_idx])
+
+# Define ufl Measure with facet_tag
+metadata = {"quadrature_degree": 2}
+dx = ufl.Measure("dx", domain=domain, metadata=metadata)
+ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tag, metadata=metadata)
 
 # Leaf tagging
 tdim = domain.topology.dim
@@ -124,27 +132,38 @@ def von_mises(stress):
 # Define Variational Problem 
 u = ufl.TrialFunction(V)
 v = ufl.TestFunction(V)
-a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
+a = ufl.inner(sigma(u), epsilon(v)) * dx
 
 # Contact formulation
 def contact_facets_between(leaf_i, leaf_j):
     tdim = domain.topology.dim
     fdim = tdim - 1
+
+    # Get all interior facets (shared by two cells)
+    domain.topology.create_connectivity(fdim, tdim)
+
+    # Map facets to their two incident cells
+    facet_to_cells = domain.topology.connectivity(fdim, tdim)
+
+    # Check which facets connect a cell from leaf_i to leaf_j
     cell_map = leaf_tag.indices
     cell_values = leaf_tag.values
-    cells_i = cell_map[cell_values == leaf_i]
-    cells_j = cell_map[cell_values == leaf_j]
-    domain.topology.create_connectivity(tdim, fdim)
-    facets_i = mesh.exterior_facet_indices(domain, cells_i)
-    facets_j = mesh.exterior_facet_indices(domain, cells_j)
-    mids_i = mesh.compute_midpoints(domain, fdim, facets_i)
-    mids_j = mesh.compute_midpoints(domain, fdim, facets_j)
+
     contact_facets = []
-    for f_i, mid_i in zip(facets_i, mids_i):
-        for mid_j in mids_j:
-            if np.allclose(mid_i, mid_j, atol=1e-8):
-                contact_facets.append(f_i)
-                break
+    for facet in range(domain.topology.index_map(fdim).size_local):
+        incident_cells = facet_to_cells.links(facet)
+        if len(incident_cells) != 2:
+            continue  # Not an interior facet
+
+        # Get leaf IDs for the two incident cells
+        try:
+            leaf_ids = [cell_values[cell_map == cell][0] for cell in incident_cells]
+        except IndexError:
+            continue  # One of the cells is not in our leaf_tag
+
+        if {leaf_i, leaf_j} == set(leaf_ids):
+            contact_facets.append(facet)
+
     return np.array(contact_facets, dtype=np.int32)
     
 # Add contact terms for each pair of adjacent leaves
@@ -161,10 +180,11 @@ for i in range(num_leaves - 1):
     # Contact term: penalty * jump in normal direction
     n = ufl.FacetNormal(domain)
     jump = ufl.dot(u, n) * ufl.dot(v, n)
-    a += penalty * jump * ufl.ds(subdomain_data=contact_tag, subdomain_id=contact_marker)
+    contact_ds = ufl.Measure("ds", domain=domain, subdomain_data=contact_tag, metadata=metadata)
+    a += penalty * jump * contact_ds(contact_marker)
 
 
-L_form = ufl.dot(traction, v) * ufl.ds(subdomain_data=facet_tag, subdomain_id=top_center_tag)
+L_form = ufl.dot(traction, v) * ds(top_center_tag)
 uh = fem.Function(V)
 problem = LinearProblem(a, L_form, bcs=bcs, u=uh, petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
 problem.solve()
@@ -277,7 +297,7 @@ for step in range(1, 11):
     traction.value[:] = np.array([0.0, -F * scale], dtype=default_scalar_type)
 
     # Reassemble RHS with updated load
-    L_form = ufl.dot(traction, v) * ufl.ds(subdomain_data=facet_tag, subdomain_id=top_center_tag)
+    L_form = ufl.dot(traction, v) * ds(top_center_tag)
     problem = LinearProblem(a, L_form, bcs=bcs, u=uh, petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
     problem.solve()
     uh.x.scatter_forward()
@@ -289,7 +309,7 @@ for step in range(1, 11):
     plotter.write_frame()
 
 plotter.close()
-print("Animation saved as 'leaf_spring_deformation.gif")
+print("Animation saved as 'leaf_spring_deformation.gif'")
 
 '''
 # HDF5 inspection
