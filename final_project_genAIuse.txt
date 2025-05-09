@@ -1,0 +1,3 @@
+ChatGPT-4o was used to help evaluate certain functions and the tests functions that utilized them.
+ChatGPT-4o was used to simplify certain elements of functions and improve overall file structure.
+ChatGPT-4o was used to help explain the logical progression of certain code/data structures for documentation purposes.
