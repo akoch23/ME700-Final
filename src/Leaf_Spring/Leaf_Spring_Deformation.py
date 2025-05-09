@@ -1,8 +1,8 @@
-# Import Necessary Libaries
+# Import Necessary Libraries
 import os
 import numpy as np
 import dolfinx
-from dolfinx import io, mesh, fem, default_scalar_type, la, plot
+from dolfinx import io, mesh, fem, default_scalar_type, plot
 from dolfinx.fem.petsc import LinearProblem
 import ufl
 from mpi4py import MPI
@@ -249,7 +249,47 @@ with io.XDMFFile(domain.comm, "leaf_tag.xdmf", "w") as xdmf:
     xdmf.write_mesh(domain)
     xdmf.write_meshtags(leaf_tag, domain.geometry)
 print("Leaf tag meshtags exported to 'leaf_tag.xdmf'")
-print(" Simulation with contact complete. Use ParaView to visualize displacement and leaf tags.")
+print(" Simulation with contact complete. You may use ParaView to visualize displacement and leaf tags.")
+
+
+# Set up VTK mesh for visualization
+topology, cells, geometry = plot.vtk_mesh(uh.function_space)
+grid = pv.UnstructuredGrid(topology, cells, geometry)
+
+# Add leaf ID to grid
+grid.cell_data["leaf_id"] = leaf_ids
+
+# Plotting Figure
+plotter = pv.Plotter(off_screen=True)
+plotter.open_gif("leaf_spring_deformation.gif", fps=10)
+
+# Initialize deformation field
+grid["u"] = uh.x.array.reshape(geometry.shape[0], 2)
+grid.set_active_vectors("u")
+warped = grid.warp_by_vector("u", factor=10.0)
+plotter.add_mesh(warped, show_edges=True, lighting=False, cmap="viridis")
+plotter.view_xy()
+
+
+# Time-stepping loop: increase load in steps
+for step in range(1, 11):
+    scale = step / 10.0
+    traction.value[:] = np.array([0.0, -F * scale], dtype=default_scalar_type)
+
+    # Reassemble RHS with updated load
+    L_form = ufl.dot(traction, v) * ufl.ds(subdomain_data=facet_tag, subdomain_id=top_center_tag)
+    problem = LinearProblem(a, L_form, bcs=bcs, u=uh, petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
+    problem.solve()
+    uh.x.scatter_forward()
+
+    # Update displacement in grid and warp
+    grid.point_data["u"][:] = uh.x.array.reshape((domain.geometry.x.shape[0], 2))
+    warped.points[:] = grid.warp_by_vector("u", factor=10.0).points
+
+    plotter.write_frame()
+
+plotter.close()
+print(\"Animation saved as 'leaf_spring_deformation.gif'\")
 
 '''
 # HDF5 inspection
