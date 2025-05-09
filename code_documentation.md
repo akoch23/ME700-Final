@@ -1,4 +1,4 @@
-# Stacked Leaf Spring Simulation with DOLFINx
+# Stacked Leaf Spring Simulation (DOLFINx)
 
 This project simulates a 2D stacked leaf spring using the finite element method (FEM) in DOLFINx. It models linear elastic behavior under a distributed load, includes per-leaf tagging, and supports visualization in ParaView.
 
