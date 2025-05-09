@@ -1,4 +1,4 @@
-# Import Necessary Libraries
+# Import Necessary Libaries
 import os
 import numpy as np
 import dolfinx
@@ -40,11 +40,11 @@ shift_y = mesh_center_y - H / 2
 # Apply vertical shift to the entire mesh
 domain.geometry.x[:, 1] += shift_y
 
-# --- Function Space ---
+# Function Space
 V = fem.functionspace(domain, ("Lagrange", 1, (2,)))
 
 
-# --- Boundary Conditions ---
+# Boundary Conditions
 # Define marker function for left and right boundaries
 def left_marker(x):
     return np.isclose(x[0], 0.0)  # Left boundary is at x=0
@@ -61,14 +61,12 @@ right_dofs = fem.locate_dofs_topological(V, fdim, mesh.locate_entities_boundary(
 u_bc_val = np.array((0.0, 0.0), dtype=default_scalar_type)
 bcs = [fem.dirichletbc(u_bc_val, left_dofs, V), fem.dirichletbc(u_bc_val, right_dofs, V)]
 
-# Load Application region
+# Load application
+H_center = H / 2
 def top_center(x):
-    return np.isclose(x[1], H / 2, atol=1e-5) & (x[0] > L / 3) & (x[0] < 2 * L / 3)
-
+    return np.isclose(x[1], H_center, atol=1e-5) & (x[0] > L / 3) & (x[0] < 2 * L / 3)
 top_center_facets = mesh.locate_entities_boundary(domain, fdim, top_center)
 top_center_tag = 4
-
-# Mark all facets
 left_facets = mesh.locate_entities_boundary(domain, fdim, left_marker)
 right_facets = mesh.locate_entities_boundary(domain, fdim, right_marker)
 marked_facets = np.hstack([left_facets, right_facets, top_center_facets])
@@ -80,7 +78,7 @@ marked_values = np.hstack([
 sort_idx = np.argsort(marked_facets)
 facet_tag = mesh.meshtags(domain, fdim, marked_facets[sort_idx], marked_values[sort_idx])
 
-# --- Leaf tagging ---
+# Leaf tagging
 tdim = domain.topology.dim
 cells = np.arange(domain.topology.index_map(tdim).size_local)
 x = mesh.compute_midpoints(domain, tdim, cells)
@@ -105,6 +103,12 @@ nu = default_scalar_type(0.3)
 # Lamé parameters (E, nu)
 mu = fem.Constant(domain, E / (2 * (1 + nu)))  # Shear modulus
 lambda_ = fem.Constant(domain, E * nu / ((1 + nu) * (1 - 2 * nu)))  # First Lamé parameter
+# Penalty parameter for contact
+penalty = fem.Constant(domain, 1e7)  # Adjust for mesh density / convergence
+
+# Load
+F = 1000.0
+traction = fem.Constant(domain, np.array([0.0, -F], dtype=default_scalar_type))
 
 # Variational formulation (linear elasticity)
 def epsilon(u):
@@ -113,40 +117,141 @@ def epsilon(u):
 def sigma(u):
     return lambda_ * ufl.nabla_div(u) * ufl.Identity(len(u)) + 2 * mu * epsilon(u)  # Stress tensor
 
+def von_mises(stress): 
+    s = stress - (1./3) * ufl.tr(stress) * ufl.Identity(2)
+    return ufl.sqrt(3./2 * ufl.inner(s, s))
+
 # Define Variational Problem 
 u = ufl.TrialFunction(V)
 v = ufl.TestFunction(V)
-# Load Vector
-F = 1000.0  # N/m², adjust to suit physical realism
-traction = fem.Constant(domain, np.array([0.0, -F], dtype=default_scalar_type))
 a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
+
+# Contact formulation
+def contact_facets_between(leaf_i, leaf_j):
+    tdim = domain.topology.dim
+    fdim = tdim - 1
+    cell_map = leaf_tag.indices
+    cell_values = leaf_tag.values
+    cells_i = cell_map[cell_values == leaf_i]
+    cells_j = cell_map[cell_values == leaf_j]
+    domain.topology.create_connectivity(tdim, fdim)
+    facets_i = mesh.exterior_facet_indices(domain, cells_i)
+    facets_j = mesh.exterior_facet_indices(domain, cells_j)
+    mids_i = mesh.compute_midpoints(domain, fdim, facets_i)
+    mids_j = mesh.compute_midpoints(domain, fdim, facets_j)
+    contact_facets = []
+    for f_i, mid_i in zip(facets_i, mids_i):
+        for mid_j in mids_j:
+            if np.allclose(mid_i, mid_j, atol=1e-8):
+                contact_facets.append(f_i)
+                break
+    return np.array(contact_facets, dtype=np.int32)
+    
+# Add contact terms for each pair of adjacent leaves
+for i in range(num_leaves - 1):
+    contact_facets = contact_facets_between(i, i + 1)
+    if len(contact_facets) == 0:
+        continue
+
+    # Tag contact interface
+    contact_marker = i + 100
+    contact_tag = mesh.meshtags(domain, fdim, contact_facets,
+                                np.full(len(contact_facets), contact_marker, dtype=np.int32))
+
+    # Contact term: penalty * jump in normal direction
+    n = ufl.FacetNormal(domain)
+    jump = ufl.dot(u, n) * ufl.dot(v, n)
+    a += penalty * jump * ufl.ds(subdomain_data=contact_tag, subdomain_id=contact_marker)
+
+
 L_form = ufl.dot(traction, v) * ufl.ds(subdomain_data=facet_tag, subdomain_id=top_center_tag)
-
-
-# Solve the linear variational problem
 uh = fem.Function(V)
 problem = LinearProblem(a, L_form, bcs=bcs, u=uh, petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
 problem.solve()
 print("Problem Solved!")
 
-# Strip any extra dimensions for ParaView compatibility
+# Format for Paraview output
 uh_array = uh.x.array.reshape((domain.geometry.x.shape[0], -1))
 uh_array = uh_array[:, :2]  # ensure 2D
 uh.x.array[:] = uh_array.flatten()
 uh.name = "Displacement"
 
+# Compute von Mises stress
+stress_expr = fem.Expression(sigma(uh), V.element.interpolation_points())
+stress_tensor = fem.Function(fem.TensorFunctionSpace(domain, ("DG", 0)))
+stress_tensor.interpolate(stress_expr)
+
+VM_expr = fem.Expression(von_mises(sigma(uh)), V.element.interpolation_points())
+VM = fem.Function(fem.FunctionSpace(domain, ("DG", 0)))
+VM.name = "von_Mises_stress"
+VM.interpolate(VM_expr)
+
+VM_values = VM.x.array
+max_vm_stress = np.max(VM_values)
+print(f"Maximum von Mises stress (FEM): {max_vm_stress:.2f} Pa")
+
+# Evaluate von Mises stress at bottom midspan
+bottom_mid = np.array([[L / 2, 0.0]])  # x = midspan, y = bottom leaf
+bbox_tree = BoundingBoxTree(domain, domain.topology.dim)
+cells = compute_collisions_points(bbox_tree, bottom_mid.T, domain)
+if len(cells[0]) > 0:
+    cell = cells[0][0]
+    vm_local = VM.eval(bottom_mid[0], cell)
+    print(f"von Mises at bottom midspan: {vm_local[0]:.2f} Pa")
+else:
+    vm_local = [None]
+    print("Could not evaluate von Mises at bottom midspan.")
+
+# FEM-Computed vs Analytical Solution
+def compare_fem_vs_analytical(F, L, E, N, b, h, fem_displacements):
+    p = 1.5  # geometric factor for simple support
+    q = 1 / 6  # geometric factor for simple support
+
+    sigma_analytical = (p * F * L) / (N * b * h**2)
+    delta_analytical = (q * F * L**3) / (E * N * b * h**3)
+
+    max_disp_y = np.min(fem_displacements[:, 1])  # downward max
+
+    print("\\n--- FEM vs Analytical ---")
+    print(f"Analytical deflection: {delta_analytical:.6f} m")
+    print(f"FEM deflection:        {abs(max_disp_y):.6f} m")
+    print(f"% Error:               {100 * abs((abs(max_disp_y) - delta_analytical) / delta_analytical):.2f}%")
+    print(f"Analytical stress:     {sigma_analytical:.2f} Pa\\n")
+
+def estimate_fatigue_life(stress_amplitude, sigma_f_prime, b, label=""):
+    if stress_amplitude <= 0:
+        print(f"{label}Invalid stress amplitude for fatigue calculation.")
+        return None
+    N_f = (sigma_f_prime / stress_amplitude) ** (1 / b)
+    print(f"{label}Estimated fatigue life: {N_f:.2e} cycles")
+    return N_f
+
+displacements = uh.x.array.reshape((domain.geometry.x.shape[0], 2))
+compare_fem_vs_analytical(F, L, E, num_leaves, W, T, displacements)
+stress_analytical = (1.5 * F * L) / (num_leaves * W * T**2)
+sigma_f_prime = 650e6  # Pa
+b = -0.1
+print("Fatigue Estimates:")
+estimate_fatigue_life(stress_analytical, sigma_f_prime, b, label="[Analytical] ")
+estimate_fatigue_life(max_vm_stress, sigma_f_prime, b, label="[FEM Max VM] ")
+if vm_local[0] is not None:
+    estimate_fatigue_life(vm_local[0], sigma_f_prime, b, label="[FEM Mid-Span] ")
+
 # Create XDMF file to save the mesh and solution
 with io.XDMFFile(domain.comm, "leaf_spring.xdmf", "w", encoding=io.XDMFFile.Encoding.HDF5) as xdmf:
     xdmf.write_mesh(domain)
     xdmf.write_function(uh)
+    xdmf.write_function(VM)
 print("Mesh and solution saved in XDMF format.")
 
-# --- Export Leaf Tags ---
+# Export Leaf Tags
 with io.XDMFFile(domain.comm, "leaf_tag.xdmf", "w") as xdmf:
     xdmf.write_mesh(domain)
     xdmf.write_meshtags(leaf_tag, domain.geometry)
 print("Leaf tag meshtags exported to 'leaf_tag.xdmf'")
+print(" Simulation with contact complete. Use ParaView to visualize displacement and leaf tags.")
 
+'''
 # HDF5 inspection
 try:
     with h5py.File("leaf_spring.h5", "r") as f:
@@ -156,64 +261,13 @@ try:
                 print(f"  - {name}: shape = {obj.shape}")
         f.visititems(print_tree)
         if "Function/Displacement/0" in f:
-            print("✅ 'Displacement' dataset found.")
+            print("Displacement' dataset found.")
         else:
-            print("⚠️ 'Displacement' dataset NOT found in HDF5 file.")
+            print("Displacement' dataset NOT found in HDF5 file.")
 except Exception as e:
-    print("⚠️ HDF5 inspection failed:", e)
+    print("HDF5 inspection failed:", e)
 
-print("✅ Simulation complete. To visualize:")
+print("Simulation complete. To visualize:")
 print("- Open 'leaf_spring.xdmf' in ParaView and use 'Warp By Vector' on 'Displacement'")
 print("- Open 'leaf_tag.xdmf' to color mesh by leaf ID")
-
-
-
-
-
 '''
-Leaf-Leaf Interaction
-'''
-'''
-# Define contact interaction (simplified example for two leaves)
-# Let's assume the contact only exists between the top and bottom of two adjacent leaves
-
-# Define test and trial functions
-u1 = dolfinx.fem.Function(V)  # Displacement on the first leaf
-u2 = dolfinx.fem.Function(V)  # Displacement on the second leaf
-v1 = ufl.TestFunction(V)  # Test function for first leaf
-v2 = ufl.TestFunction(V)  # Test function for second leaf
-
-# Contact term: enforce displacement equality at the interface
-contact_term = ufl.inner(u1 - u2, v1) * ufl.ds  # Penalty method
-
-# Add this to the weak form of the problem
-a_contact = contact_term  # Apply contact force as a weak formulation
-
-# Assemble the system
-L_vec_contact = dolfinx.fem.assemble_vector(a_contact)
-'''
-
-
-'''
-Solving
-'''
-'''
-# Assemble the system matrices
-A = dolfinx.fem.assemble_matrix(a, [bc])
-L_vec = dolfinx.fem.assemble_vector(L)
-L_vec_contact = dolfinx.fem.assemble_vector(a_contact)
-
-# Combine the load vectors
-L_vec_total = L_vec + L_vec_contact
-
-# Apply boundary conditions to the load vector
-dolfinx.fem.apply_dirichlet_bc(L_vec_total, [bc])
-
-# Solve the system
-solver = PETSc.KSP().create(MPI.COMM_WORLD)
-solver.setOperators(A)
-solver.setType('preonly')  # Direct solver
-solver.setTolerances(rtol=1e-8)
-solver.solve(L_vec_total, u.vector)
-'''
-
