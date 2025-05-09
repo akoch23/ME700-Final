@@ -1,4 +1,4 @@
-# Leaf Spring Simulation: Skills Demonstrated
+# Leaf Spring Simulation: ME 700 Applied Skills
 
 ### Technical Knowledge
 - Matrix structural analysis using FEM
