@@ -289,7 +289,7 @@ for step in range(1, 11):
     plotter.write_frame()
 
 plotter.close()
-print(\"Animation saved as 'leaf_spring_deformation.gif'\")
+print("Animation saved as 'leaf_spring_deformation.gif")
 
 '''
 # HDF5 inspection
